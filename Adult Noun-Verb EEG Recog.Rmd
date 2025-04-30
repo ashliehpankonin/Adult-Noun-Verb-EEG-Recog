@@ -1,0 +1,1350 @@
+---
+title: "Adult Noun-Verb EEG Recog"
+author: "Ashlie"
+date: "2024-02-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+##### NEED TO REVISE PROCESS OF MODEL SIMPLIFICAITON BECAUSE WAS USING SD TO DECIDE WHICH COMPONENTS TO REMOVE RATHER THAN PROPORTION OF VARIANCE #####
+
+
+# Libraries
+pacman::p_load(knitr, # rendering of .Rmd file
+               lme4, # model specification/estimation
+               afex, # anova and deriving p-values via LRTs from lmer
+               broom.mixed, # extracting data from model fits
+               faux, # generate correlated values
+               tidyverse, # data wrangling and visualization 
+               ggridges, # visualization
+               viridis, # color schemes for visualization
+               kableExtra, # helps with knitting the .Rmd file
+               cowplot, # visualization tool to include multiple plots
+               ggrain, # visualization tool for raincloud plots
+               dplyr, # data manipulation tools
+               here, # controlling directories/reproducibility
+               tidyr, # formatting package
+               readr, # data importation
+               Hmisc, # visualization
+               emmeans, # estimation of marginal means and contrasts
+               sjstats, # estimation of marginal means and contrasts
+               lmerTest, # deriving p-values from lmer
+               MuMIn, # ?
+               sjPlot, # APA formatting of numerical output
+               car, # data wrangling and visualization,
+               magrittr, # to use %>%
+               ggpubr, # ? (Rose had it in her script)
+               broom, # ? (Rose had it in her script)
+               Matrix, # model specification/estimation,
+               #renv # package versioning/reproducibility
+               )
+
+# Global theme set
+set.seed(1234) # set random seed for reproducibility
+
+#knitr::opts_chunk$set(echo = TRUE)
+
+#theme_set(theme_bw(base_size = 13) + theme(text = element_text(size=13), 
+                             #axis.title=element_text(size=12),
+                             #strip.text = element_text(margin=margin(2,0,2,0)), 
+                             #panel.grid = element_blank()))
+
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE, fig.width=10, fig.height=8, fig.fullwidth=TRUE)
+
+plot_theme <- 
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 18), 
+        axis.text.x = element_text(size = 13), 
+        axis.title.x = element_text(size = 13), 
+        axis.text.y = element_text(size = 12), 
+        axis.title.y = element_text(size = 13),
+        strip.background = element_rect(color="white", fill="white", linewidth = 1.5, linetype="solid"))
+
+```
+
+# Sentence Length Data
+## Data Manipulations
+```{r}
+# Load data (1 data frame)
+senlen_data <- read.csv(here("FYP Data","Noun & Verb Data", "Behavioral Word Learning Data","Sentence Length Data.csv"),stringsAsFactors=TRUE) # sentence length data
+
+senlen_data %<>%
+  mutate(Experiment.Cond = factor(Word.Class), 
+         Meaning.Condition = factor(Meaning.Condition),
+         Sentence.Length = as.numeric(Sentence.Length),
+         exp.cond.c = as.numeric(Experiment.Cond) - 1.5,
+         meaning.cond.c = as.numeric(Meaning.Condition) - 1.5)
+str(senlen_data)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive); default reference level = unsupportive/M-
+# For meaning condition, M+ = -0.5 (after centering), M- = 0.5 (after centering)
+```
+## Descriptives
+```{r}
+# Sentence length by word class (collapsed across linguistic context and pseudoword/target word)
+senlen_data %>%
+  group_by(Experiment.Cond)%>%
+  summarise_at('Sentence.Length', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Sentence length by word class and linguistic context (collapsed across pseudoword/target word)
+senlen_data %>%
+  group_by(Experiment.Cond, Meaning.Condition)%>%
+  summarise_at('Sentence.Length', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Meaning.Condition, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+```
+
+## Analyses
+Maximal model: Sentence Length (continuous variable) ~ Word Class (Noun, Verb) * Linguistic Context (Unsupportive, Supportive) + (1 + Linguistic Context|Triplet)
+
+Iif any model does not converge/takes a very long time to converge and/or has singularity issues, I will follow the steps outlined in Bates et al. (2018) to iteratively reduce the model complexity of all models via PCA and removing correlations between random effects (if possible--doesn't seem so for GLMMs), removing random effects with no variability, and reintroducing and, if necessary, removing correlations between random effects once again. (According to Brauer and Curtain (2018), there's little to no harm in including near-zero variance random effects, so I will do like Barr et al. (2013) and keep my models (possibly overly) maximal as long as they converge and do not have singularity issues.) 
+
+Final model: Sentence Length (continuous variable) ~ Word Class (Noun, Verb) * Linguistic Context (Unsupportive, Supportive)
+
+### High-level summary of these models:
+1. The length of the sentences in the Noun and Verb condition, as well as within each condition across linguistic context, are significantly different. Specifically, Unsupportive (M-) Noun sentences are significantly longer than Unsupportive (M-) Verb sentences and significantly longer than Supportive (M+) Noun sentences. Additionally, Supportive (M+) Noun sentences are significantly longer than Supportive (M+) Verb sentences, and Supportive (M+) Verb sentences are significantly longer than Unsupportive (M-) Verb sentences. Overall, ordered by sentence length, the conditions would be ordered as: Unsupportive (M-) Noun > Supportive (M+) Noun > Supportive (M+) Verb > Unsupportive (M-) Verb
+
+```{r}
+#senlen.max <- lmer(Sentence.Length ~ Experiment.Cond*Meaning.Condition + (1 + Experiment.Cond*Meaning.Condition|Triplet), data=senlen_data) # not enough observations for random effects
+
+senlen_data$Experiment.Cond <- relevel(senlen_data$Experiment.Cond, ref = "noun")
+senlen_data$Meaning.Condition <- relevel(senlen_data$Meaning.Condition, ref = "M-")
+
+senlen.m1.uncentered <- lm(Sentence.Length ~ Experiment.Cond*Meaning.Condition, data=senlen_data)
+summary(senlen.m1.uncentered)
+
+senlen_data$Experiment.Cond <- relevel(senlen_data$Experiment.Cond, ref = "verb")
+senlen_data$Meaning.Condition <- relevel(senlen_data$Meaning.Condition, ref = "M+")
+
+senlen.m1.uncentered <- lm(Sentence.Length ~ Experiment.Cond*Meaning.Condition, data=senlen_data)
+summary(senlen.m1.uncentered)
+
+senlen.m1.centered <- lm(Sentence.Length ~ exp.cond.c*meaning.cond.c, data=senlen_data)
+summary(senlen.m1.centered)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive); default reference level = unsupportive/M-
+# For meaning condition, M+ = -0.5 (after centering), M- = 0.5 (after centering)
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering)
+```
+
+# Nonword Length Data
+## Data Manipulations
+```{r}
+# Load data (1 data frame)
+nonwordlen_data <- read.csv(here("FYP Data","Noun & Verb Data", "Behavioral Word Learning Data","Nonword Length Data.csv"),stringsAsFactors=TRUE) # nonword length data
+
+nonwordlen_data %<>%
+  mutate(Experiment.Cond = factor(Condition), 
+         File.Length = as.numeric(File.Length),
+         exp.cond.c = as.numeric(Experiment.Cond) - 1.5)
+str(nonwordlen_data)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+```
+
+## Descriptives
+```{r}
+# Nonword length by word class
+nonwordlen_data %>%
+  group_by(Experiment.Cond)%>%
+  summarise_at('File.Length', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+```
+
+## Analyses
+Maximal model: Nonword Length (continuous variable) ~ Word Class (Noun, Verb)
+
+Iif any model does not converge/takes a very long time to converge and/or has singularity issues, I will follow the steps outlined in Bates et al. (2018) to iteratively reduce the model complexity of all models via PCA and removing correlations between random effects (if possible--doesn't seem so for GLMMs), removing random effects with no variability, and reintroducing and, if necessary, removing correlations between random effects once again. (According to Brauer and Curtain (2018), there's little to no harm in including near-zero variance random effects, so I will do like Barr et al. (2013) and keep my models (possibly overly) maximal as long as they converge and do not have singularity issues.) 
+
+Final model: Nonword Length (continuous variable) ~ Word Class (Noun, Verb)
+
+### High-level summary of these models:
+1. The length of the nonwords in the Noun and Verb condition are not significantly different.
+
+```{r}
+nonwordlen.max <- lm(File.Length ~ Experiment.Cond, data=nonwordlen_data)
+summary(nonwordlen.max)
+
+nonwordlen.max.centered <- lm(File.Length ~ exp.cond.c,data=nonwordlen_data)
+summary(nonwordlen.max.centered)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+```
+
+# Meaning Identification Data
+## Data Manipulations
+```{r}
+# Load data (1 data frame)
+meaningid_data <- read.csv(here("FYP Data","Noun & Verb Data", "Behavioral Word Learning Data","WLfC Binary Data.csv"),stringsAsFactors=TRUE) # meaning identification data
+
+meaningid_data %<>%
+  mutate(Participant.ID = factor(Participant.ID), 
+         Experiment.Cond = factor(Experiment.Cond), 
+         Meaning.Condition = factor(Meaning.Condition), 
+         Response.Correct. = as.numeric(Response.Correct.), 
+         Gender = factor(Gender),
+         Nonword = factor(Nonword),
+         Target = factor(Target),
+         nwr.arc = as.numeric(sapply(NWR, function (x) asin(sqrt(x)))),
+         nwr.arc.c = as.numeric(scale(nwr.arc, center = TRUE, scale = FALSE)),
+         age.c = as.numeric(scale(Age, center = TRUE, scale = FALSE)),
+         exp.cond.c = as.numeric(Experiment.Cond) - 1.5,
+         meaning.cond.c = as.numeric(Meaning.Condition) - 1.5,
+         gender.c = as.numeric(Gender) - 1.5)
+str(meaningid_data)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive); default reference level = unsupportive/M-
+# For meaning condition, M+ = -0.5 (after centering), M- = 0.5 (after centering)
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering)
+```
+
+## Sanity checks
+```{r}
+# Is each participant in only one experimental condition?
+# Expected: TRUE (between-subjects design)
+meaningid_data %>% group_by(Participant.ID) %>%
+  summarise(Experiment.Cond = n_distinct(Experiment.Cond)) %>%
+  as.data.frame() %>% 
+  {.$Experiment.Cond == 1} %>%
+  all()
+
+# Number of included participants per experimental condition
+# Expected: Noun = 31, Verb = 23
+meaningid_data %>% group_by(Participant.ID) %>%
+  filter(is.na(Exclusion.Reason))%>%
+  summarise(Experiment.Cond = first(Experiment.Cond)) %>%
+  ungroup() %>%
+  group_by(Experiment.Cond) %>%
+  summarise(n = n())
+
+# Number of different target words (collapsed across participants) by word class and linguistic context 
+# Expected: Noun: M- = 1 (Target)/50 (Distinct.Target), M+ = 50; Verb: M- = 1 (Target)/50 (Distinct.Target), M+ = 50
+meaningid_data %>%  
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition) %>%
+  summarise(items = n_distinct(Target))
+  #summarise(items = n_distinct(Distinct.Target))
+
+# Number of different psuedowords (collapsed across participants) by word class and linguistic context
+# Expected: Noun: M- = 200, M+ = 200; Verb: M- = 200, M+ = 200
+meaningid_data %>%  
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition) %>%
+  summarise(items = n_distinct(Nonword))
+
+# Number of different target words per participant by linguistic context
+# Expected: M- = 1 (Target)/50 (Distinct.Target), M+ = 50
+meaningid_data %>%  
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Participant.ID, Meaning.Condition) %>%
+  summarise(items = n_distinct(Target))
+  #summarise(items = n_distinct(Distinct.Target))
+
+
+# Number of different psuedowords words per participant by linguistic context
+# Expected: M- = 50, M+ = 50
+meaningid_data %>%  
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Participant.ID, Meaning.Condition) %>%
+  summarise(items = n_distinct(Nonword))
+```
+
+## Participants
+### Inclusions/exclusions
+```{r}
+meaningid_data %>%
+  distinct(Participant.ID, Experiment.Cond, Exclude., Exclusion.Reason)%>%
+  group_by(Exclude.,Experiment.Cond, Exclusion.Reason)%>%
+  summarise(n = n())%>%
+  mutate(total.Exclusion.Reason.n = sum(n))%>%
+  knitr::kable()
+```
+
+### Age and gender demographics
+```{r}
+# Age
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  distinct(Participant.ID, Experiment.Cond, Age)%>%
+  group_by(Experiment.Cond)%>%
+  summarise_at('Age', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Total mean age, sd
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  distinct(Participant.ID, Experiment.Cond, Age)%>%
+  summarise_at('Age', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Gender
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  distinct(Participant.ID, Experiment.Cond, Gender)%>%
+  group_by(Experiment.Cond, Gender)%>%
+  summarise(n = n())%>%
+  mutate(total.Gender.n = sum(n))%>%
+  knitr::kable()
+```
+
+## Descriptives
+```{r}
+# General meaning identification by word class (collapsed across linguistic context and pseudoword/target word)
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by word class and linguistic context (collapsed across pseudoword/target word)
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Meaning.Condition, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by word class and psuedoword (collapsed across linguistic context)
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Nonword)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by linguistic context and psuedoword (collapsed across word class)
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Meaning.Condition, Nonword)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Meaning.Condition, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by word class, linguistic context, and psuedoword 
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition, Nonword)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Meaning.Condition, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by word class and target word (collapsed across linguistic context)
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Distinct.Target)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Distinct.Target, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by linguistic context and target word (collapsed across word class)
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Meaning.Condition, Distinct.Target)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Meaning.Condition, Distinct.Target, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# General meaning identification by word class, linguistic context, and target word 
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition, Distinct.Target)%>%
+  summarise_at('Meaning.Identified.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Meaning.Condition, Distinct.Target, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+```
+
+## Visualizations
+### Mean general meaning identification (collapsed across items) by word class and linguistic context
+```{r dev = "png"}
+meaningid_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  mutate(Meaning.Condition = factor(Meaning.Condition, levels = c("M-", "M+"), 
+                                    labels = c("Unsupportive", "Supportive")))%>%
+  ggplot(aes(x = Experiment.Cond, y = Meaning.Identified., fill = Experiment.Cond, color = Experiment.Cond)) + 
+  stat_summary(fun = mean, position = position_dodge(width = .9),
+               geom="bar", alpha = .5, colour = "black") +
+  geom_point(position=position_jitter(width = .18, height = .1),
+             size=1.5,
+             alpha = .6,
+             show.legend=FALSE,
+             inherit.aes = TRUE) +
+  geom_hline(yintercept = 0.5, color = "grey", linetype = "dashed") + 
+  facet_grid(~Meaning.Condition) + 
+  #coord_cartesian(ylim = c(0, 1)) +
+  stat_summary(fun.data = "mean_cl_boot", geom="linerange", 
+               position = position_dodge(width=0.9), linewidth = 1, color = "black") +
+  theme(legend.position = "top", 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.key.size = unit(.5, 'cm'), 
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 11), 
+        legend.margin=margin(t = 0, unit='cm')) +
+  langcog::scale_color_solarized() + 
+  langcog::scale_fill_solarized() + 
+  labs(y = "Mean General Meaning Identification", 
+       x = "", 
+       fill = "Word Class") + 
+  scale_y_continuous(breaks = seq(0, 1, .25))
+#ggsave("mean_general_meaning_ID.png", height = 3)
+
+meaningid_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  mutate(Meaning.Condition = factor(Meaning.Condition, levels = c("M-", "M+"), 
+                       labels = c("Unsupportive", "Supportive")))%>%
+  ggplot(aes(x = Experiment.Cond, y = Meaning.Identified., fill = Meaning.Condition, color = Meaning.Condition)) + 
+  stat_summary(fun = mean, position = position_dodge(width = .9),
+               geom="bar", colour = "black") + 
+  geom_hline(yintercept = .5, color = "grey", linetype = "dashed") + 
+  facet_grid(~Meaning.Condition) + 
+  stat_summary(fun.data = "mean_cl_boot", geom="linerange", 
+               position = position_dodge(width=0.9), size = 1, color = "black") +
+  # scale_fill_brewer(palette = "Dark2") +
+  langcog::scale_fill_solarized()+
+  labs(y = "Mean General Meaning Identification", 
+       x = "Word Class", 
+       fill = "Linguistic Context")  +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), 
+        legend.key.size = unit(.5, 'cm'), 
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 11), 
+        legend.margin=margin(t = 0, unit='cm'), 
+        plot.title = element_text(size = 12)) +
+  guides(fill = guide_legend(title.position = "top")) +
+  scale_y_continuous(breaks = seq(0, 1,.25)) #+ 
+  #ggtitle("title")
+#ggsave("mean_general_meaning_ID.png", height = 3)
+```
+
+### Mean general meaning identification (collapsed across items) by participant, word class, and linguistic context
+```{r}
+agg_p <- meaningid_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Participant.ID, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Meaning.Identified.)) %>%
+  ungroup()
+
+ggplot(agg_p, aes(x = interaction(Experiment.Cond,Meaning.Condition), y = mean)) +
+  ggbeeswarm::geom_quasirandom(alpha = 0.5) +
+  geom_boxplot(fill = "transparent") +
+  stat_summary(colour = "red") #+
+  #facet_grid(cols = vars(Experiment.Cond), rows = vars(Meaning.Condition))
+
+```
+
+### Mean general meaning identification by psuedoword, word class, and linguistic context
+```{r}
+agg_i <- meaningid_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Nonword, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Meaning.Identified.)) %>%
+  ungroup()
+
+ggplot(agg_i, aes(x = interaction(Experiment.Cond, Meaning.Condition), y = mean)) +
+  ggbeeswarm::geom_quasirandom(alpha = 0.3) +
+  geom_boxplot(fill = "transparent") +
+  stat_summary(colour = "red") #+
+  #facet_grid(cols = vars(Experiment.Cond), rows = vars(Meaning.Condition))
+```
+
+### Mean general meaning identification by target word, word class, and linguistic context
+```{r}
+agg_i <- meaningid_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Distinct.Target, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Meaning.Identified.)) %>%
+  ungroup()
+
+ggplot(agg_i, aes(x = interaction(Experiment.Cond, Meaning.Condition), y = mean)) +
+  ggbeeswarm::geom_quasirandom(alpha = 0.3) +
+  geom_boxplot(fill = "transparent") +
+  stat_summary(colour = "red") #+
+  #facet_grid(cols = vars(Experiment.Cond), rows = vars(Meaning.Condition))
+```
+
+## Analyses
+### Nouns
+Maximal model: General Meaning Identification (No Meaning Identified, Meaning Identified) ~ Linguistic Context (Unsupportive, Supportive) + NWR + Age + Gender + (1 + Linguistic Context|Subject) + (1 + Linguistic Context|Psuedoword) + (1|Distinct Target)
+
+Iif any model does not converge/takes a very long time to converge and/or has singularity issues, I will follow the steps outlined in Bates et al. (2018) to iteratively reduce the model complexity of all models via PCA and removing correlations between random effects (if possible--doesn't seem so for GLMMs), removing random effects with no variability, and reintroducing and, if necessary, removing correlations between random effects once again. (According to Brauer and Curtain (2018), there's little to no harm in including near-zero variance random effects, so I will do like Barr et al. (2013) and keep my models (possibly overly) maximal as long as they converge and do not have singularity issues.)
+
+Final model: General Meaning Identification (No Meaning Identified, Meaning Identified) ~ Linguistic Context (Unsupportive, Supportive) + NWR + Age + Gender + (1 + Linguistic Context|Subject) + (1|Psuedoword) + (1|Distinct Target)
+
+### High-level summary of these models:
+1. Controlling for phonological memory, age, and gender, participants were significantly more likely to identify a meaning for a novel noun presented in the Supportive (M+) context than in the Unsupportive (M-) context 
+
+```{r}
+#nounmeanid.max <- glmer(Meaning.Identified. ~ Meaning.Condition + nwr.arc.c + age.c + gender.c + (1 + Meaning.Condition|Participant.ID) + (1 + Meaning.Condition|Nonword) +(1|Distinct.Target), data=subset(meaningid_data,is.na(Exclusion.Reason) & Experiment.Cond == "Noun"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # isSingular warning
+#summary(nounmeanid.max)
+
+#summary(rePCA(nounmeanid.max)) # PCA results indicate 1 dimension (Meaning.Condition) with no variability in the random effects for Nonword, so removing that random effect
+
+nounmeanid.m1 <- glmer(Meaning.Identified. ~ Meaning.Condition + nwr.arc.c + age.c + gender.c + (1 + Meaning.Condition|Participant.ID) + (1|Nonword) +(1|Distinct.Target), data=subset(meaningid_data,is.na(Exclusion.Reason) & Experiment.Cond == "Noun"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # converges
+summary(nounmeanid.m1)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive); default reference level = unsupportive/M-
+# For meaning condition, M+ = -0.5 (after centering), M- = 0.5 (after centering)
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering)
+```
+### Verbs
+Maximal model: General Meaning Identification (No Meaning Identified, Meaning Identified) ~ Linguistic Context (Unsupportive, Supportive) + NWR + Age + (1 + Linguistic Context|Subject) + (1 + Linguistic Context|Psuedoword) + (1|Distinct Target)
+
+Iif any model does not converge/takes a very long time to converge and/or has singularity issues, I will follow the steps outlined in Bates et al. (2018) to iteratively reduce the model complexity of all models via PCA and removing correlations between random effects (if possible--doesn't seem so for GLMMs), removing random effects with no variability, and reintroducing and, if necessary, removing correlations between random effects once again. (According to Brauer and Curtain (2018), there's little to no harm in including near-zero variance random effects, so I will do like Barr et al. (2013) and keep my models (possibly overly) maximal as long as they converge and do not have singularity issues.) 
+
+Final model: General Meaning Identification (No Meaning Identified, Meaning Identified) ~ Linguistic Context (Unsupportive, Supportive) + NWR + Age + (1 + Linguistic Context|Subject) + (1|Psuedoword) + (1|Distinct Target)
+
+### High-level summary of these models:
+1. Controlling for phonological memory, age, and gender, participants were significantly more likely to identify a meaning for a novel verb presented in the Supportive (M+) context than in the Unsupportive (M-) context
+
+```{r}
+#verbmeanid.max <- glmer(Meaning.Identified. ~ Meaning.Condition + nwr.arc.c + age.c + (1 + Meaning.Condition|Participant.ID) + (1 + Meaning.Condition|Nonword)+(1|Distinct.Target), data=subset(meaningid_data,is.na(Exclusion.Reason) & Experiment.Cond == "Verb"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # isSingular warning
+#summary(verbmeanid.max)
+
+#summary(rePCA(verbmeanid.max)) # PCA results indicate 1 dimension (Meaning.Condition) with no variability in the random effects for Nonword, so removing that random effect
+
+verbmeanid.m1 <- glmer(Meaning.Identified. ~ Meaning.Condition + nwr.arc.c + age.c + (1 + Meaning.Condition|Participant.ID) + (1|Nonword)+(1|Distinct.Target), data=subset(meaningid_data,is.na(Exclusion.Reason) & Experiment.Cond == "Verb"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # converges
+summary(verbmeanid.m1)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive); default reference level = unsupportive/M-
+# For meaning condition, M+ = -0.5 (after centering), M- = 0.5 (after centering)
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering) -- variable not included in verb only model because all participants were female
+```
+
+# Recognition Data
+## Data Manipulations
+```{r}
+# Load data (1 data frame)
+recog_data <- read.csv(here("FYP Data","Noun & Verb Data", "EEG Recog Data", "Adult Noun-Verb EEG Recog Data.csv"),stringsAsFactors=TRUE) # recognition data
+
+recog_data %<>%
+  mutate(Participant.ID = factor(Participant.ID), 
+         Experiment.Cond = factor(Experiment.Condition), 
+         Meaning.Condition = factor(Meaning.Condition), 
+         Trial = as.numeric(Trial),
+         Correct.Response. = as.numeric(Correct.Response.), 
+         Word.Status = factor(Word.Status),
+         Gender = factor(Gender),
+         Nonword = factor(Nonword),
+         nwr.arc = as.numeric(sapply(NWR, function (x) asin(sqrt(x)))),
+         nwr.arc.c = as.numeric(scale(nwr.arc, center = TRUE, scale = FALSE)),
+         age.c = as.numeric(scale(Age, center = TRUE, scale = FALSE)),
+         exp.cond.c = as.numeric(Experiment.Cond) - 1.5,
+         gender.c = as.numeric(Gender) - 1.5)
+str(recog_data)
+
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive, new = not seen in previous meaning ID task); default reference level = unsupportive/M- (when included) or supportive/M+ (when unsupportive/M- excluded)
+# Word status = re: (opportunity for) meaning identification; default reference level = Meaning ID
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering)
+```
+
+## Sanity checks
+```{r}
+# Is each participant in only one experimental condition?
+# Expected: TRUE (between-subjects design)
+recog_data %>% group_by(Participant.ID) %>%
+  summarise(Experiment.Cond = n_distinct(Experiment.Cond)) %>%
+  as.data.frame() %>% 
+  {.$Experiment.Cond == 1} %>%
+  all()
+
+# Number of included participants per experimental condition
+# Expected: Noun = 31, Verb = 23
+recog_data %>% group_by(Participant.ID) %>%
+  filter(is.na(Exclusion.Reason))%>%
+  summarise(Experiment.Cond = first(Experiment.Cond)) %>%
+  ungroup() %>%
+  group_by(Experiment.Cond) %>%
+  summarise(n = n())
+
+# Number of different psuedowords (collapsed across participants) by word class and linguistic context
+# Expected: Noun: M- = 200, M+ = 200, New = 200; Verb: M- = 200, M+ = 200, New = 200
+recog_data %>%  
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition) %>%
+  summarise(items = n_distinct(Nonword))
+
+# Number of different psuedowords words per participant by linguistic context
+# Expected: M- = 50, M+ = 50, New = 100
+recog_data %>%  
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Participant.ID, Meaning.Condition) %>%
+  summarise(items = n_distinct(Nonword))
+
+# Included/excluded participants
+# Expected: Noun: NA (n = 31), bad EEG data (n = 2), bilingual (n = 12), pilot (n = 3), hand bias (n = 1); Verb: NA (n = 24), hand bias (n = 1), not enough epochs after rejection (n = 1)
+recog_data %>%
+  distinct(Participant.ID, Experiment.Cond, Exclude., Exclusion.Reason)%>%
+  group_by(Exclude.,Experiment.Cond, Exclusion.Reason)%>%
+  summarise(n = n())%>%
+  mutate(total.Exclusion.Reason.n = sum(n))%>%
+  knitr::kable()
+
+# Age
+# Expected: Noun: n = 31, M = 21.25, SD = 2.64, median = 20.48, min = 18.00, max = 29.69, N = 54; Verb: n = 23, M = 20.87, SD = 1.14, median = 21.19, min = 19.05, max = 23.05, N = 54
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  distinct(Participant.ID, Experiment.Cond, Age)%>%
+  group_by(Experiment.Cond)%>%
+  summarise_at('Age', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Total mean age, sd
+# Expected: n = 54, M = 21.09, SD =	2.12, median = 20.84, min =	18, max =	29.69, N = 54 
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  distinct(Participant.ID, Experiment.Cond, Age)%>%
+  summarise_at('Age', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Gender
+# Expected: Noun: F = 29, M = 2; Verb: F = 23
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  distinct(Participant.ID, Experiment.Cond, Gender)%>%
+  group_by(Experiment.Cond, Gender)%>%
+  summarise(n = n())%>%
+  mutate(total.Gender.n = sum(n))%>%
+  knitr::kable()
+```
+
+## Descriptives
+```{r}
+# Recognition accuracy by word class (collapsed across linguistic context and pseudoword and disregarding word status)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word class and linguistic context (collapsed across pseudoword and disregarding word status)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Meaning.Condition, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word class and psuedoword (collapsed across linguistic context and disregarding word status)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Nonword)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by linguistic context and psuedoword (collapsed across word class and disregarding word status)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Meaning.Condition, Nonword)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Meaning.Condition, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word class, linguistic context, and psuedoword (and disregarding word status) 
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Experiment.Cond, Meaning.Condition, Nonword)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Experiment.Cond, Meaning.Condition, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word status and word class (collapsed across linguistic context and pseudoword)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Word.Status, Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word status, word class and linguistic context (collapsed across pseudoword)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond, Meaning.Condition)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Word.Status, Experiment.Cond, Meaning.Condition, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word status, word class, and psuedoword (collapsed across linguistic context)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond, Nonword)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Word.Status, Experiment.Cond, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word status, linguistic context, and psuedoword (collapsed across word class)
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Meaning.Condition, Nonword)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Word.Status, Meaning.Condition, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+
+# Recognition accuracy by word status, word class, linguistic context, and psuedoword
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond, Meaning.Condition, Nonword)%>%
+  summarise_at('Correct.Response.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Word.Status, Experiment.Cond, Meaning.Condition, Nonword, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+```
+
+## Visualizations
+### Mean recognition accuracy (collapsed across items) by word class and linguistic context (disregarding word status)
+```{r dev = "png"} 
+
+recog_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  mutate(Meaning.Condition = factor(Meaning.Condition, levels = c("M-", "M+","new"), 
+                                    labels = c("Unsupportive", "Supportive","New")))%>%
+  ggplot(aes(x = Experiment.Cond, y = Correct.Response., fill = Experiment.Cond, color = Experiment.Cond)) + 
+  stat_summary(fun = mean, position = position_dodge(width = .9),
+               geom="bar", alpha = .5, colour = "black") +
+  geom_point(position=position_jitter(width = .18, height = .1),
+             size=1.5,
+             alpha = .6,
+             show.legend=FALSE,
+             inherit.aes = TRUE) +
+  geom_hline(yintercept = 0.5, color = "grey", linetype = "dashed") + 
+  facet_grid(~Meaning.Condition) + 
+  #coord_cartesian(ylim = c(0, 1)) +
+  stat_summary(fun.data = "mean_cl_boot", geom="linerange", 
+               position = position_dodge(width=0.9), linewidth = 1, color = "black") +
+  theme(legend.position = "top", 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.key.size = unit(.5, 'cm'), 
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 11), 
+        legend.margin=margin(t = 0, unit='cm')) +
+  #langcog::scale_color_solarized() + 
+  #langcog::scale_fill_solarized() + 
+  labs(y = "Mean Recognition Accuracy", 
+       x = "", 
+       fill = "Word Class") + 
+  scale_y_continuous(breaks = seq(0, 1, .25))
+#ggsave("mean_accuracy.png", height = 3)
+
+recog_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  mutate(Meaning.Condition = factor(Meaning.Condition, levels = c("M-", "M+","new"), 
+                       labels = c("Unsupportive", "Supportive","New")))%>%
+  ggplot(aes(x = Experiment.Cond, y = Correct.Response., fill = Meaning.Condition, color = Meaning.Condition)) + 
+  stat_summary(fun = mean, position = position_dodge(width = .9),
+               geom="bar", colour = "black") + 
+  geom_hline(yintercept = .5, color = "grey", linetype = "dashed") + 
+  facet_grid(~Meaning.Condition) + 
+  stat_summary(fun.data = "mean_cl_boot", geom="linerange", 
+               position = position_dodge(width=0.9), size = 1, color = "black") +
+  # scale_fill_brewer(palette = "Dark2") +
+  #langcog::scale_fill_solarized()+
+  labs(y = "Mean Recognition Accuracy", 
+       x = "Word Class", 
+       fill = "Linguistic Context")  +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), 
+        legend.key.size = unit(.5, 'cm'), 
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 11), 
+        legend.margin=margin(t = 0, unit='cm'), 
+        plot.title = element_text(size = 12)) +
+  guides(fill = guide_legend(title.position = "top")) +
+  scale_y_continuous(breaks = seq(0, 1,.25)) #+ 
+  #ggtitle("title")
+#ggsave("mean_accuracy.png", height = 3)
+```
+
+### Mean recognition accuracy (collapsed across items) by word status and linguistic context (disregarding word class)
+```{r dev = "png"} 
+
+recog_data %>% 
+  filter(is.na(Exclusion.Reason) & Meaning.Condition !="M-")%>%
+  ggplot(aes(x = Experiment.Cond, y = Correct.Response., fill = Experiment.Cond, color = Experiment.Cond)) + 
+  stat_summary(fun = mean, position = position_dodge(width = .9),
+               geom="bar", alpha = .5, colour = "black") +
+  geom_point(position=position_jitter(width = .18, height = .1),
+             size=1.5,
+             alpha = .6,
+             show.legend=FALSE,
+             inherit.aes = TRUE) +
+  geom_hline(yintercept = 0.5, color = "grey", linetype = "dashed") + 
+  facet_grid(~Word.Status) + 
+  #coord_cartesian(ylim = c(0, 1)) +
+  stat_summary(fun.data = "mean_cl_boot", geom="linerange", 
+               position = position_dodge(width=0.9), linewidth = 1, color = "black") +
+  theme(legend.position = "top", 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.key.size = unit(.5, 'cm'), 
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 11), 
+        legend.margin=margin(t = 0, unit='cm')) +
+  #langcog::scale_color_solarized() + 
+  #langcog::scale_fill_solarized() + 
+  labs(y = "Mean Recognition Accuracy", 
+       x = "", 
+       fill = "Word Status") + 
+  scale_y_continuous(breaks = seq(0, 1, .25))
+#ggsave("mean_accuracy.png", height = 3)
+
+recog_data %>%
+  filter(is.na(Exclusion.Reason) & Meaning.Condition !="M-")%>%
+  ggplot(aes(x = Experiment.Cond, y = Correct.Response., fill = Word.Status, color = Word.Status)) + 
+  stat_summary(fun = mean, position = position_dodge(width = .9),
+               geom="bar", colour = "black") + 
+  geom_hline(yintercept = .5, color = "grey", linetype = "dashed") + 
+  facet_grid(~Word.Status) + 
+  stat_summary(fun.data = "mean_cl_boot", geom="linerange", 
+               position = position_dodge(width=0.9), size = 1, color = "black") +
+  # scale_fill_brewer(palette = "Dark2") +
+  #langcog::scale_fill_solarized()+
+  labs(y = "Mean Recognition Accuracy", 
+       x = "Word Status", 
+       fill = "Linguistic Context")  +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), 
+        legend.key.size = unit(.5, 'cm'), 
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 11), 
+        legend.margin=margin(t = 0, unit='cm'), 
+        plot.title = element_text(size = 12)) +
+  guides(fill = guide_legend(title.position = "top")) +
+  scale_y_continuous(breaks = seq(0, 1,.25)) #+ 
+  #ggtitle("title")
+#ggsave("mean_accuracy.png", height = 3)
+```
+
+#### Mean recogntion accuracy (collapsed across items) by participant, word status, word class, and linguistic context
+```{r}
+agg_p <- recog_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Participant.ID, Word.Status, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Correct.Response.)) %>%
+  ungroup()
+
+ggplot(agg_p, aes(x = interaction(Word.Status, Experiment.Cond,Meaning.Condition), y = mean)) +
+  ggbeeswarm::geom_quasirandom(alpha = 0.5) +
+  geom_boxplot(fill = "transparent") +
+  stat_summary(colour = "red") +
+  theme(axis.text.x = element_text(angle = 45))#+
+  #facet_grid(cols = vars(Experiment.Cond), rows = vars(Meaning.Condition))
+```
+
+#### Mean recognition accuracy by psuedoword, word status, word class, and linguistic context
+```{r}
+agg_i <- recog_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Nonword, Word.Status, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Correct.Response.)) %>%
+  ungroup()
+
+ggplot(agg_i, aes(x = interaction(Word.Status, Experiment.Cond, Meaning.Condition), y = mean)) +
+  ggbeeswarm::geom_quasirandom(alpha = 0.3) +
+  geom_boxplot(fill = "transparent") +
+  stat_summary(colour = "red") +
+  theme(axis.text.x = element_text(angle = 45))#+
+  #facet_grid(cols = vars(Experiment.Cond), rows = vars(Meaning.Condition))
+```
+
+#### Mean recognition accuracy by word status, word class, and linguistic context
+```{r}
+agg_i <- recog_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Correct.Response.)) %>%
+  ungroup()
+
+ggplot(agg_i, aes(x = interaction(Word.Status, Experiment.Cond, Meaning.Condition), y = mean)) +
+  ggbeeswarm::geom_quasirandom(alpha = 0.3) +
+  geom_boxplot(fill = "transparent") +
+  stat_summary(colour = "red") +
+  theme(axis.text.x = element_text(angle = 45))#+
+  #facet_grid(cols = vars(Experiment.Cond), rows = vars(Meaning.Condition))
+```
+
+#### Mean recognition accuracy by participant, word status, word class, and linguistic context
+```{r}
+agg_p <- recog_data %>% 
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond, Meaning.Condition) %>%
+  summarise(mean = mean(Correct.Response.)) %>%
+  ungroup()
+
+ggplot(agg_p, aes(x=Word.Status, y=mean, shape=Experiment.Cond, color=Meaning.Condition)) +
+  geom_point() + 
+  geom_smooth(method="lm",se=FALSE, fullrange=TRUE) +
+  labs(x="Word Status", y = "Mean Recognition Accuracy")+
+  theme_classic()
+```
+
+## Analyses
+Maximal model: Accuracy (Incorrect, Correct) ~ Word Status (Meaning Identified, No Meaning Identified, New) * Word Class (Noun, Verb) + NWR + Age + Gender + (1 + Word Status * Word Class|Subject) + (1 + Word Status * Word Class|Psuedoword)
+
+Iif any model does not converge/takes a very long time to converge and/or has singularity issues, I will follow the steps outlined in Bates et al. (2018) to iteratively reduce the model complexity of all models via PCA and removing correlations between random effects (if possible--doesn't seem so for GLMMs), removing random effects with no variability, and reintroducing and, if necessary, removing correlations between random effects once again. (According to Brauer and Curtain (2018), there's little to no harm in including near-zero variance random effects, so I will do like Barr et al. (2013) and keep my models (possibly overly) maximal as long as they converge and do not have singularity issues.) 
+
+Final model: Accuracy (Incorrect, Correct) ~ Word Status (Meaning Identified, No Meaning Identified, New) * Word Class (Noun, Verb) + NWR + Age + Gender + (1 |Subject) + (1 |Psuedoword)
+
+### High-level summary of these models:
+Controlling for phonological memory, age, and gender:
+- Nouns: old != new; mean ID = no mean ID
+- Verbs: old != new; mean ID = no mean ID
+- mean ID vs no mean ID: nouns = verbs
+- old vs new: nouns = verbs
+- overall recog: nouns = verbs
+- mean ID: nouns = verbs
+- no mean ID: nouns = verbs
+- new: nouns = verbs
+   
+```{r}
+#nounverbrecogacc.max <- glmer(Correct.Response. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 + Word.Status*Experiment.Cond|Participant.ID) + (1 + Word.Status*Experiment.Cond|Nonword), data=subset(recog_data,is.na(Exclusion.Reason) & Meaning.Condition != "M+"| Meaning.Condition == "new"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # does not converge
+
+#summary(rePCA(nounverbrecogacc.max)) # PCA results indicate 3 dimensions (No Meaning ID, Noun, and Verb) with no variability in the random effects for Participant ID and Nonword, so removing the random effect of Word Class (i.e., Experiment Cond)
+
+#nounverbrecogacc.m1 <- glmer(Correct.Response. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 + Word.Status|Participant.ID) + (1 + Word.Status|Nonword), data=subset(recog_data,is.na(Exclusion.Reason) & Meaning.Condition != "M+"| Meaning.Condition == "new"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # does not converge
+
+#summary(rePCA(nounverbrecogacc.m1)) # PCA results indicate 1 dimension (No Meaning ID) with no variability in the random effects for Participant ID and Nonword, so removing the random effect of Word Status
+
+# Nouns
+recog_data$Experiment.Cond <- relevel(recog_data$Experiment.Cond, ref = "Noun")
+recog_data$Word.Status <- factor(recog_data$Word.Status, levels = c("Meaning ID", "No Meaning ID", "New"))
+ contrasts(recog_data$Word.Status) <- matrix(
+   c(  0.5,  0.5, -1,  # "New" vs. "Old" ("Meaning ID", "No Meaning ID")
+     -0.5,  0.5,  0),  # "No Meaning ID" vs. "Meaning ID"
+   ncol = 2
+ )
+nounverbrecogacc.m2 <- glmer(Correct.Response. ~ Word.Status * Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 |Participant.ID) + (1 |Nonword), data=subset(recog_data,is.na(Exclusion.Reason) & Meaning.Condition != "M+"| Meaning.Condition == "new"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # converges
+summary(nounverbrecogacc.m2)
+
+# Verbs
+recog_data$Experiment.Cond <- relevel(recog_data$Experiment.Cond, ref = "Verb")
+recog_data$Word.Status <- factor(recog_data$Word.Status, levels = c("Meaning ID", "No Meaning ID", "New"))
+ contrasts(recog_data$Word.Status) <- matrix(
+   c(  0.5,  0.5, -1,  # "New" vs. "Old" ("Meaning ID", "No Meaning ID")
+     -0.5,  0.5,  0),  # "No Meaning ID" vs. "Meaning ID"
+   ncol = 2
+ )
+nounverbrecogacc.m2 <- glmer(Correct.Response. ~ Word.Status * Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 |Participant.ID) + (1 |Nonword), data=subset(recog_data,is.na(Exclusion.Reason) & Meaning.Condition != "M+"| Meaning.Condition == "new"), family = 'binomial', control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4))) # converges
+summary(nounverbrecogacc.m2)
+
+# Nouns vs. Verbs Comparisons
+emm <- emmeans(nounverbrecogacc.m2, ~ Word.Status | Experiment.Cond)
+contrast(emmeans(nounverbrecogacc.m2, ~ Experiment.Cond), "pairwise", adjust = "bonferroni")
+contrast(emmeans(nounverbrecogacc.m2, ~ Experiment.Cond | Word.Status), "pairwise", adjust = "bonferroni")
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Meaning condition = linguistic context (M- = unsupportive, M+ = supportive, new = not seen in previous meaning ID task); default reference level = unsupportive/M- (when included) or supportive/M+ (when unsupportive/M- excluded)
+# Word status = re: (opportunity for) meaning identification; default reference level = Meaning ID
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering)
+```
+
+
+## A' Calculations
+
+### Checking signal and noise distributions (i.e., determining whether d' or A' is more appropriate before proceding further)
+Results: Not all of the data (i.e., the No Meaning Identified data) follows a normal distribution, so A' is more appropriate than d'.
+```{r} 
+# d’ (d-prime) - Use when you have a signal detection task with binary responses (hit/miss, false alarm/correct rejection) and want a measure of sensitivity that accounts for response bias. Assumes that signal and noise distributions are Gaussian (i.e., normally distributed) with equal variance. If assumptions are violated (e.g., unequal variances), d’ might not be appropriate. Formula: d' = Z(hit rate) - Z(false alarm rate) where Z is the inverse of the normal cumulative distribution function
+
+# A’ (A-prime) - Use when you want a bias-corrected sensitivity measure, but your data do not meet the equal-variance Gaussian assumption of d’. A’ is a nonparametric alternative to d’ and is more robust to assumption violations. Formula: 
+# when H > F: A' = 0.5 + [(H - F)(1 + H - F)]/[4H(1 - F)]
+# when H <= F: A' = 0.5 + [(F - H)(1 + F - H)]/[4F(1 - H)]
+
+# Load data (1 data frame)
+hitmiss_data <- read.csv(here("FYP Data","Noun & Verb Data", "EEG Recog Data", "Hit & Miss Data.csv"),stringsAsFactors=TRUE) # hit and miss data
+
+hitmiss_data %<>%
+  mutate(hits = as.numeric(Hits),
+         misses = as.numeric(Misses.False.Negatives))
+str(hitmiss_data)
+
+meanid_data <- subset(hitmiss_data, Condition == "Meaning ID")
+nomeanid_data <- subset(hitmiss_data, Condition == "No Meaning ID")
+new_data <- subset(hitmiss_data, Condition == "New")
+
+# Shapiro-Wilk Test 
+# H0: The data is normally distributed.
+# HA: The data is not normally distributed.
+# p < 0.05 = the data does NOT follow a normal distribution
+# p >= 0.05 = the data DOES follow a normal distribution
+
+# Meaning Identified
+# qqnorm(meanid_data$hits)
+# qqline(meanid_data$hits)  # adds the reference line for a normal distribution
+# 
+# qqnorm(meanid_data$misses)
+# qqline(meanid_data$misses)  # adds the reference line for a normal distribution
+
+shapiro.test(meanid_data$hits)  # For hits data - follows normal distribution
+shapiro.test(meanid_data$misses)  # For misses data - follows normal distribution
+
+# No Meaning Identified
+# qqnorm(nomeanid_data$hits)
+# qqline(nomeanid_data$hits)  # adds the reference line for a normal distribution
+# 
+# qqnorm(nomeanid_data$misses)
+# qqline(nomeanid_data$misses)  # adds the reference line for a normal distribution
+
+shapiro.test(nomeanid_data$hits)  # For hits data - does NOT follow normal distribution
+shapiro.test(nomeanid_data$misses)  # For misses data - does NOT follow normal distribution
+
+# New
+# qqnorm(new_data$hits)
+# qqline(new_data$hits)  # adds the reference line for a normal distribution
+# 
+# qqnorm(new_data$misses)
+# qqline(new_data$misses)  # adds the reference line for a normal distribution
+
+shapiro.test(new_data$hits)  # For hits data - follows normal distribution
+shapiro.test(new_data$misses)  # For misses data - follows normal distribution
+```
+
+### Data Manipulations
+```{r}
+# Load data (1 data frame)
+aprime_data <- read.csv(here("FYP Data","Noun & Verb Data", "EEG Recog Data", "Adult Noun-Verb EEG Recog A' Data.csv"),stringsAsFactors=TRUE) # A' data
+
+aprime_data %<>%
+  mutate(Participant.ID = factor(Participant.ID), 
+         Experiment.Cond = factor(Experiment.Condition), 
+         A. = as.numeric(A.),
+         Word.Status = factor(Word.Status),
+         Gender = factor(Gender),
+         nwr.arc = as.numeric(sapply(NWR, function (x) asin(sqrt(x)))),
+         nwr.arc.c = as.numeric(scale(nwr.arc, center = TRUE, scale = FALSE)),
+         age.c = as.numeric(scale(Age, center = TRUE, scale = FALSE)),
+         exp.cond.c = as.numeric(Experiment.Cond) - 1.5,
+         gender.c = as.numeric(Gender) - 1.5)
+str(aprime_data)
+
+# Notes:
+# Experimental condition = word class; default reference level = noun
+# For experimental condition, noun = -0.5 (after centering), verb = 0.5 (after centering)
+# Word status = re: (opportunity for) meaning identification; default reference level = Meaning ID
+# For gender, female = -0.5 (after centering), male = 0.5 (after centering)
+```
+
+### Descriptives
+```{r}
+# A' by word class and old/new  status
+aprime_data %>%
+  filter(is.na(Exclusion.Reason)) %>%
+  mutate(Word.Status = case_when(
+    Word.Status %in% c("Meaning ID", "No Meaning ID") ~ "Old",
+    Word.Status == "New" ~ "New"
+  )) %>%
+  group_by(Word.Status, Experiment.Cond) %>%
+  summarise_at('A.', 
+               list(~mean(., na.rm = TRUE), 
+                    ~sd(., na.rm = TRUE),
+                    ~median(., na.rm = TRUE),
+                    ~min(., na.rm = TRUE),
+                    ~max(., na.rm = TRUE),
+                    ~sum(!is.na(.)))) %>%
+  dplyr::rename("n" = "sum") %>%
+  dplyr::select(Word.Status, Experiment.Cond, n, mean, sd, median, min, max) %>%
+  mutate(total.n = sum(n)) %>%
+  knitr::kable()
+
+# A' by word class and word status
+aprime_data %>%
+  filter(is.na(Exclusion.Reason))%>%
+  group_by(Word.Status, Experiment.Cond)%>%
+  summarise_at('A.', 
+               list(~mean(., na.rm=T), 
+                    ~sd(., na.rm=T),
+                    ~median(., na.rm=T),
+                    ~min(., na.rm=T),
+                    ~max(., na.rm=T),
+                    ~sum(!is.na(.))))%>%
+  dplyr::rename("n" = "sum")%>%
+  dplyr::select(Word.Status, Experiment.Cond, n, mean, sd, median, min, max)%>%
+  mutate(total.n = sum(n))%>%
+  knitr::kable()
+```
+
+### Analyses
+Maximal model: A' ~ Word Status (Meaning Identified, No Meaning Identified, New) * Word Class (Noun, Verb) + NWR + Age + Gender + (1 + Word Status * Word Class|Subject)
+
+Iif any model does not converge/takes a very long time to converge and/or has singularity issues, I will follow the steps outlined in Bates et al. (2018) to iteratively reduce the model complexity of all models via PCA and removing correlations between random effects (if possible--doesn't seem so for GLMMs), removing random effects with no variability, and reintroducing and, if necessary, removing correlations between random effects once again. (According to Brauer and Curtain (2018), there's little to no harm in including near-zero variance random effects, so I will do like Barr et al. (2013) and keep my models (possibly overly) maximal as long as they converge and do not have singularity issues.) 
+
+Final model: A' ~ Word Status (Meaning Identified, No Meaning Identified, New) * Word Class (Noun, Verb) + NWR + Age + Gender + (1 |Subject)
+
+### High-level summary of these models:
+Controlling for phonological memory, age, and gender:
+- Nouns: old = new; mean ID = no mean ID
+- Verbs: old = new; mean ID = no mean ID
+- mean ID vs no mean ID: nouns = verbs
+- old vs new: nouns = verbs
+- overall recog: nouns = verbs
+- mean ID: nouns = verbs
+- no mean ID: nouns != verbs
+- new: nouns = verbs
+
+```{r} 
+# aprime_max <- lmer(A. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 + Word.Status*Experiment.Cond|Participant.ID), data=subset(aprime_data,is.na(Exclusion.Reason))) # fewer  observations than random effects
+# 
+# aprime_m1 <- lmer(A. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 + Word.Status+Experiment.Cond|Participant.ID), data=subset(aprime_data,is.na(Exclusion.Reason))) # fewer  observations than random effects
+# 
+# aprime_m2 <- lmer(A. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 + Word.Status|Participant.ID), data=subset(aprime_data,is.na(Exclusion.Reason))) # fewer  observations than random effects
+
+# Nouns
+aprime_data$Experiment.Cond <- relevel(aprime_data$Experiment.Cond, ref = "Noun")
+aprime_data$Word.Status <- factor(aprime_data$Word.Status, levels = c("Meaning ID", "No Meaning ID", "New"))
+contrasts(aprime_data$Word.Status) <- matrix(
+   c(  0.5,  0.5, -1,  # "New" vs. "Old" ("Meaning ID", "No Meaning ID")
+     -0.5,  0.5,  0),  # "No Meaning ID" vs. "Meaning ID"
+   ncol = 2
+ )
+aprime_m3 <- lmer(A. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 |Participant.ID), data=subset(aprime_data,is.na(Exclusion.Reason))) # converges
+summary(aprime_m3)
+
+# Verbs
+aprime_data$Experiment.Cond <- relevel(aprime_data$Experiment.Cond, ref = "Verb")
+aprime_data$Word.Status <- factor(aprime_data$Word.Status, levels = c("Meaning ID", "No Meaning ID", "New"))
+contrasts(aprime_data$Word.Status) <- matrix(
+   c(  0.5,  0.5, -1,  # "New" vs. "Old" ("Meaning ID", "No Meaning ID")
+     -0.5,  0.5,  0),  # "No Meaning ID" vs. "Meaning ID"
+   ncol = 2
+ )
+aprime_m3 <- lmer(A. ~ Word.Status*Experiment.Cond + nwr.arc.c + age.c + gender.c + (1 |Participant.ID), data=subset(aprime_data,is.na(Exclusion.Reason))) # converges
+summary(aprime_m3)
+
+# Nouns vs. Verbs Comparisons
+emm <- emmeans(aprime_m3, ~ Word.Status | Experiment.Cond)
+contrast(emmeans(aprime_m3, ~ Experiment.Cond), "pairwise", adjust = "bonferroni")
+contrast(emmeans(aprime_m3, ~ Experiment.Cond | Word.Status), "pairwise", adjust = "bonferroni")
+```
+
